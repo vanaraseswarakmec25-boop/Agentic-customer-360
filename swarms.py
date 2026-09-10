@@ -1,7 +1,7 @@
 # swarms.py
 import re
 from schemas import CustomerState
-from vaderSentiment import SentimentIntensityAnalyzer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 analyzer = SentimentIntensityAnalyzer()
 LEGAL_FRAUD_PATTERN = r"\b(sue|suing|lawsuit|attorney|lawyer|court|litigation|fraud|hacked|stolen)\b"
