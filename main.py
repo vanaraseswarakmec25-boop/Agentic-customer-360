@@ -7,7 +7,11 @@ from swarms import (
     usage_swarm_worker,
     support_swarm_worker,
     transaction_swarm_worker,
+    run_agent_debate,
+    run_round_robin_drafting,
+    run_critique_refiner,
 )
+from memory import query_episodic_memory, add_episodic_memory
 
 # 1. Initialize the FastAPI application
 app = FastAPI(title="Agentic Customer 360 Ingestion Desk")
@@ -46,6 +50,26 @@ async def process_event_stream(event: EventInput):
         support_swarm_worker(event.payload, state),
         transaction_swarm_worker(event.payload, state),
     )
+    category = event.payload.get("category", "general")
+    past_memories = query_episodic_memory(
+        customer_id=event.customer_id,
+        query_text=ticket_text or event.event_type,
+        category=category,
+        similarity_threshold=0.78
+    )
+    debate_result = await run_agent_debate(state, past_memories)
+    draft_result = await run_round_robin_drafting(state, debate_result.resolution_strategy)
+    refiner_result = await run_critique_refiner(draft_result)
+
+    add_episodic_memory(
+        customer_id=event.customer_id,
+        event_type=event.event_type,
+        summary=refiner_result.final_output,
+        category=category,
+        metadata={"resolution": debate_result.resolution_strategy}
+    )
+
+    status_flag = "PROCESSED" if refiner_result.approved else "HITL_REQUIRED"
 
     # Return the populated State Board (before passing to Groq LLM)
     return {
