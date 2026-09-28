@@ -7,11 +7,11 @@ from schemas import CustomerState, DebateResult, DraftMessage, RefinerOutput
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # Load environment variables
-load_dotenv()
+load_dotenv(override=True)
 
 # Initialize Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL_NAME = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODEL_NAME = "openai/gpt-oss-120b"
 
 analyzer = SentimentIntensityAnalyzer()
 LEGAL_FRAUD_PATTERN = (
@@ -46,12 +46,12 @@ def run_fastpath_guardrail(text: str) -> bool:
 
 # 2. Non-LLM Edge Swarm Workers
 async def usage_swarm_worker(payload: dict, state: CustomerState):
-    weekly_logins = payload.get("weekly_logins", 10)
-    baseline_avg = payload.get("baseline_avg_logins", 10)
+    weekly_logins = float(payload.get("weekly_logins", 10))
+    baseline_avg = float(payload.get("baseline_avg_logins", 10))
     if baseline_avg > 0 and weekly_logins < (0.5 * baseline_avg):
-        state.usage_trend = "severe_drop_off_50%"
+        state.usage_trend = -1.0
     else:
-        state.usage_trend = "normal"
+        state.usage_trend = 0.0
 
 
 async def support_swarm_worker(payload: dict, state: CustomerState):

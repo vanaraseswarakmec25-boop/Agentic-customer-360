@@ -1,8 +1,9 @@
 import asyncio
+import json
 import os
 from datetime import datetime
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI,HTTPException
 from memory import (
     add_episodic_memory,
     add_semantic_memory,
@@ -27,6 +28,22 @@ app = FastAPI(title="Agentic Customer 360 Ingestion Desk")
 # Global in-memory storage for HITL pending review tickets
 hitl_queue = {}
 
+def log_inferred_event(
+    customer_id: str,
+    inferred_state: str,
+    confidence_level: float,
+    action_decided: str,
+):
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "customer_id": customer_id,
+        "inferred_customer_state": inferred_state,
+        "confidence_level": confidence_level,
+        "action_decided": action_decided,
+    }
+    with open("inferred_events.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(log_entry) + "\n")
+        f.flush()  # Forces Python to clear the buffer and write to disk immediately
 
 @app.get("/")
 def read_root():
@@ -58,6 +75,13 @@ async def resolve_hitl_ticket(ticket_id: str, action_data: dict):
             category="compliance",
             metadata={"reviewer_action": "APPROVED", "ticket_id": ticket_id},
         )
+        # Log HITL Approval event
+        log_inferred_event(
+            customer_id=ticket["customer_id"],
+            inferred_state="Human Verified",
+            confidence_level=1.00,
+            action_decided="HUMAN_APPROVED",
+        )
         return {
             "status": "SUCCESS",
             "message": f"Ticket {ticket_id} approved and dispatched.",
@@ -71,113 +95,156 @@ async def resolve_hitl_ticket(ticket_id: str, action_data: dict):
             category="compliance",
             metadata={"reviewer_action": "REJECTED", "ticket_id": ticket_id},
         )
+        # Log HITL Rejection event
+        log_inferred_event(
+            customer_id=ticket["customer_id"],
+            inferred_state="Draft Rejected",
+            confidence_level=1.00,
+            action_decided="HUMAN_REJECTED",
+        )
         return {"status": "SUCCESS", "message": f"Ticket {ticket_id} rejected."}
 
 
 # --- INGESTION ENDPOINT ---
 @app.post("/events/stream")
 async def process_event_stream(event: EventInput):
-    ticket_text = event.payload.get(
-        "ticket_text", event.payload.get("message", "")
-    )
-    category = event.payload.get("category", "general")
-
-    # Stage A: Fast-Path Guardrail
-    if run_fastpath_guardrail(ticket_text):
-        output = InferredEventOutput(
-            customer_id=event.customer_id,
-            timestamp=datetime.now().isoformat(),
-            detected_life_event="Legal / Fraud Threat Flagged",
-            action_taken="HALTED: Escalated directly to Human Legal Queue",
-            reasoning="Synchronous Regex Guardrail matched high-risk keywords.",
-            hitl_approved=False,
-            status="LEGAL_ESCALATION",
+    try:
+        ticket_text = event.payload.get(
+            "ticket_text", event.payload.get("message", "")
         )
-        return {"status": "HALTED_LEGAL_ESCALATION", "data": output}
+        category = event.payload.get("category", "general")
 
-    # Stage B: Shared State Initialization
-    state = CustomerState(customer_id=event.customer_id)
+        # Stage A: Fast-Path Guardrail
+        if run_fastpath_guardrail(ticket_text):
+            output = InferredEventOutput(
+                customer_id=event.customer_id,
+                timestamp=datetime.now().isoformat(),
+                detected_life_event="Legal / Fraud Threat Flagged",
+                action_taken="HALTED: Escalated directly to Human Legal Queue",
+                reasoning="Synchronous Regex Guardrail matched high-risk keywords.",
+                hitl_approved=False,
+                status="LEGAL_ESCALATION",
+            )
+            log_inferred_event(
+                customer_id=event.customer_id,
+                inferred_state="Legal Risk Flagged",
+                confidence_level=0.99,
+                action_decided="HALTED_LEGAL_ESCALATION",
+            )
+            return {"status": "HALTED_LEGAL_ESCALATION", "data": output}
 
-    # Stage C: Run Non-LLM Swarm Workers
-    await asyncio.gather(
-        usage_swarm_worker(event.payload, state),
-        support_swarm_worker(event.payload, state),
-        transaction_swarm_worker(event.payload, state),
-    )
+        # Stage B: Shared State Initialization
+        state = CustomerState(customer_id=event.customer_id)
 
-    # Save Semantic Trait BEFORE Context Retrieval
-    extracted_trait = event.payload.get("extracted_trait")
-    if extracted_trait:
-        add_semantic_memory(
+        # Stage C: Run Non-LLM Swarm Workers
+        await asyncio.gather(
+            usage_swarm_worker(event.payload, state),
+            support_swarm_worker(event.payload, state),
+            transaction_swarm_worker(event.payload, state),
+        )
+
+        extracted_trait = event.payload.get("extracted_trait")
+        if extracted_trait:
+            add_semantic_memory(
+                customer_id=event.customer_id,
+                fact=extracted_trait,
+                category=category,
+            )
+
+        # Stage D: Retrieve Dual Memory Context
+        context = await retrieve_customer_context(
             customer_id=event.customer_id,
-            fact=extracted_trait,
+            query_text=ticket_text or event.event_type,
             category=category,
         )
+        past_memories = context["episodic"]
+        semantic_facts = context["semantic"]
 
-    # Stage D: Retrieve Dual Memory Context
-    context = await retrieve_customer_context(
-        customer_id=event.customer_id,
-        query_text=ticket_text or event.event_type,
-        category=category,
-    )
-    past_memories = context["episodic"]
-    semantic_facts = context["semantic"]
+        # Stage E: Multi-Agent Debate & Refinement
+        debate_result = await run_agent_debate(
+            state=state,
+            memories=past_memories,
+            semantic_facts=semantic_facts,
+        )
+        draft_result = await run_round_robin_drafting(
+            state, debate_result.resolution_strategy
+        )
+        refiner_result = await run_critique_refiner(draft_result)
 
-    # Stage E: Multi-Agent Debate & Refinement
-    debate_result = await run_agent_debate(
-        state=state,
-        memories=past_memories,
-        semantic_facts=semantic_facts,
-    )
-    draft_result = await run_round_robin_drafting(
-        state, debate_result.resolution_strategy
-    )
-    refiner_result = await run_critique_refiner(draft_result)
+        # Stage F: Store Episodic Memory
+        add_episodic_memory(
+            customer_id=event.customer_id,
+            event_type=event.event_type,
+            summary=ticket_text,
+            category=category,
+            metadata={"resolution": debate_result.resolution_strategy},
+        )
 
-    # Stage F: Store Episodic Memory
-    add_episodic_memory(
-        customer_id=event.customer_id,
-        event_type=event.event_type,
-        summary=ticket_text,
-        category=category,
-        metadata={"resolution": debate_result.resolution_strategy},
-    )
+        status_flag = (
+            "PROCESSED" if refiner_result.approved else "HITL_REQUIRED"
+        )
+        ticket_id = (
+            f"TICK-{event.customer_id}-{datetime.now().strftime('%M%S')}"
+        )
 
-    status_flag = "PROCESSED" if refiner_result.approved else "HITL_REQUIRED"
-    ticket_id = f"TICK-{event.customer_id}-{datetime.now().strftime('%M%S')}"
+        try:
+            usage_trend = float(state.usage_trend)
+        except (TypeError, ValueError):
+            usage_trend = 0.0
 
-    if status_flag == "HITL_REQUIRED":
-        hitl_queue[ticket_id] = {
-            "ticket_id": ticket_id,
+        inferred_trait = extracted_trait or (
+            "High Churn Risk" if usage_trend < 0 else "Active Customer"
+        )
+
+        if status_flag == "HITL_REQUIRED":
+            hitl_queue[ticket_id] = {
+                "ticket_id": ticket_id,
+                "customer_id": state.customer_id,
+                "timestamp": datetime.now().isoformat(),
+                "reason": debate_result.reasoning,
+                "drafts": draft_result,
+                "final_response": refiner_result.final_output,
+                "status": status_flag,
+            }
+            log_inferred_event(
+                customer_id=event.customer_id,
+                inferred_state=inferred_trait,
+                confidence_level=0.85,
+                action_decided="HITL_REQUIRED",
+            )
+        else:
+            log_inferred_event(
+                customer_id=event.customer_id,
+                inferred_state=inferred_trait,
+                confidence_level=0.95,
+                action_decided="AUTO_DISPATCH",
+            )
+
+        return {
+            "status": "SWARM_PROCESSING_COMPLETE",
             "customer_id": state.customer_id,
-            "timestamp": datetime.now().isoformat(),
-            "reason": debate_result.reasoning,
-            "drafts": draft_result,
-            "final_response": refiner_result.final_output,
-            "status": status_flag,
+            "shared_state_board": {
+                "usage_trend": state.usage_trend,
+                "sentiment_score": state.sentiment_score,
+                "transaction_anomaly_score": state.transaction_anomaly_score,
+            },
+            "episodic_memory": {
+                "count": len(past_memories),
+                "memories": past_memories,
+            },
+            "semantic_memory": {
+                "count": len(semantic_facts),
+                "facts": semantic_facts,
+            },
+            "agent_outputs": {
+                "conflict_detected": debate_result.conflict_detected,
+                "resolution_strategy": debate_result.resolution_strategy,
+                "drafts": draft_result,
+                "final_response": refiner_result.final_output,
+                "status": status_flag,
+            },
         }
-
-    return {
-        "status": "SWARM_PROCESSING_COMPLETE",
-        "customer_id": state.customer_id,
-        "shared_state_board": {
-            "usage_trend": state.usage_trend,
-            "sentiment_score": state.sentiment_score,
-            "transaction_anomaly_score": state.transaction_anomaly_score,
-        },
-        "episodic_memory": {
-            "count": len(past_memories),
-            "memories": past_memories,
-        },
-        "semantic_memory": {
-            "count": len(semantic_facts),
-            "facts": semantic_facts,
-        },
-        "agent_outputs": {
-            "conflict_detected": debate_result.conflict_detected,
-            "resolution_strategy": debate_result.resolution_strategy,
-            "drafts": draft_result,
-            "final_response": refiner_result.final_output,
-            "status": status_flag,
-        },
-    }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"DEBUG ERROR: {type(e).__name__} - {str(e)}"
+        )
