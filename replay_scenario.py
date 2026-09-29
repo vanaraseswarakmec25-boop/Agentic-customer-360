@@ -36,9 +36,15 @@ def run_scenario(scenario_folder="scenario_01"):
 
     try:
         with open(stream_file, "r", encoding="utf-8") as f:
-            for line in f:
+            for idx, line in enumerate(f):
                 if line.strip():
                     event = json.loads(line)
+                    
+                    # --- OPTION B: DYNAMIC CUSTOMER ID OVERRIDE ---
+                    # Forces a new customer ID for each incoming event line
+                    event["customer_id"] = f"CUST_{idx + 1:05d}"
+                    # ----------------------------------------------
+
                     res = requests.post(
                         f"{FASTAPI_URL}/events/stream", json=event
                     )
@@ -56,5 +62,10 @@ def run_scenario(scenario_folder="scenario_01"):
 
 
 if __name__ == "__main__":
-    # Test on scenario 1
-    run_scenario("scenario_01")
+    # Run multiple customer scenarios back-to-back
+    scenarios = ["scenario_01", "scenario_02", "scenario_03"]
+    
+    # Don't delete logs between scenario runs if you want them in one file
+    for scenario in scenarios:
+        if os.path.exists(scenario):
+            run_scenario(scenario)

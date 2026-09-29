@@ -263,10 +263,30 @@ async def process_event_stream(event: EventInput):
             f"TICK-{event.customer_id}-{datetime.now().strftime('%M%S')}"
         )
 
+        # --- UPDATED DOMAIN-SPECIFIC EVENT CLASSIFICATION ---
         text_lower = ticket_text.lower() if ticket_text else ""
+        payload = event.payload or {}
+        event_type = getattr(event, "event_type", "")
+        amount = payload.get("amount", 0)
+        is_international = payload.get("is_international", False)
 
+        # 1. Direct LLM/Agent override
         if extracted_trait:
             inferred_trait = extracted_trait
+
+        # 2. Financial Anomaly / High-Value Events (e.g. EVT_000382: $12k transfer)
+        elif event_type in ["outbound_transfer", "wire_transfer"] and amount >= 10000:
+            inferred_trait = "HIGH_VALUE_TRANSFER"
+        elif event_type == "purchase" and (amount >= 5000 or is_international):
+            inferred_trait = "SUSPICIOUS_TRANSACTION"
+        elif state.transaction_anomaly_score and float(state.transaction_anomaly_score) > 3.0:
+            inferred_trait = "TRANSACTION_ANOMALY"
+
+        # 3. Usage & Churn Trends from Swarm Workers
+        elif state.usage_trend and float(state.usage_trend) < -0.5:
+            inferred_trait = "CHURN_RISK"
+
+        # 4. Text & Sentiment Keyword Fallbacks (for support messages/tickets)
         elif any(w in text_lower for w in ["cancel", "awful", "terrible", "leaving", "frustrated", "bad"]):
             inferred_trait = "CHURN_RISK"
         elif any(w in text_lower for w in ["payment", "charged", "refund", "billing", "invoice"]):
@@ -275,8 +295,23 @@ async def process_event_stream(event: EventInput):
             inferred_trait = "TECHNICAL_ISSUE"
         elif state.sentiment_score and float(state.sentiment_score) < -0.3:
             inferred_trait = "AT_RISK"
+
+        # 5. Low-level routine telemetry (e.g. app logins)
+        elif event_type == "login":
+            inferred_trait = "ROUTINE_ACTIVITY"
+
+        # 6. Fallback
         else:
             inferred_trait = "STABLE"
+
+        # --- UPDATED GUARDRAIL & HITL ROUTING ---
+        # Force HITL review for high-risk states or refiner rejections
+        HIGH_RISK_STATES = {"HIGH_VALUE_TRANSFER", "SUSPICIOUS_TRANSACTION", "CHURN_RISK"}
+        
+        if inferred_trait in HIGH_RISK_STATES or not refiner_result.approved:
+            status_flag = "HITL_REQUIRED"
+        else:
+            status_flag = "PROCESSED"
 
         if status_flag == "HITL_REQUIRED":
             hitl_queue[ticket_id] = {
