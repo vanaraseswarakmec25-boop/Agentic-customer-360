@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import re
+import time
 from datetime import datetime
 from dotenv import load_dotenv
-from fastapi import FastAPI,HTTPException
+from fastapi import FastAPI, HTTPException
 from memory import (
     add_episodic_memory,
     add_semantic_memory,
@@ -28,6 +30,33 @@ app = FastAPI(title="Agentic Customer 360 Ingestion Desk")
 # Global in-memory storage for HITL pending review tickets
 hitl_queue = {}
 
+# Global storage for tracking customer event timelines in strict chronological order
+customer_event_timelines = {}
+
+
+def parse_iso_timestamp(ts_str: str) -> datetime:
+    """Parses standard ISO timestamps for chronological sorting."""
+    if not ts_str:
+        return datetime.now()
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except Exception:
+        return datetime.now()
+
+
+def sanitize_pii(text: str) -> str:
+    """Masks SSNs, Credit Cards, and Emails before sending text to LLM agents."""
+    if not isinstance(text, str):
+        return text
+    # Mask Credit Cards
+    text = re.sub(r'\b(?:\d[ -]*?){13,16}\b', '[REDACTED_CARD]', text)
+    # Mask SSNs
+    text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[REDACTED_SSN]', text)
+    # Mask Emails
+    text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[REDACTED_EMAIL]', text)
+    return text
+
+
 def log_inferred_event(
     customer_id: str,
     inferred_state: str,
@@ -43,7 +72,9 @@ def log_inferred_event(
     }
     with open("inferred_events.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(log_entry) + "\n")
-        f.flush()  # Forces Python to clear the buffer and write to disk immediately
+        f.flush()
+        os.fsync(f.fileno())
+
 
 @app.get("/")
 def read_root():
@@ -55,6 +86,24 @@ def read_root():
 async def get_hitl_queue():
     """Retrieve all tickets currently pending human review."""
     return {"pending_count": len(hitl_queue), "queue": list(hitl_queue.values())}
+
+
+@app.get("/hitl/review/{ticket_id}")
+async def review_hitl_ticket(ticket_id: str):
+    """Allows human approver to inspect reasoning, draft choices, and memory context."""
+    if ticket_id not in hitl_queue:
+        raise HTTPException(status_code=404, detail="Ticket ID not found in review queue.")
+    
+    ticket = hitl_queue[ticket_id]
+    return {
+        "ticket_id": ticket_id,
+        "customer_id": ticket["customer_id"],
+        "timestamp": ticket["timestamp"],
+        "why_flagged": ticket["reason"],
+        "draft_options": ticket["drafts"],
+        "recommended_response": ticket["final_response"],
+        "status": ticket["status"],
+    }
 
 
 @app.post("/hitl/action/{ticket_id}")
@@ -75,7 +124,6 @@ async def resolve_hitl_ticket(ticket_id: str, action_data: dict):
             category="compliance",
             metadata={"reviewer_action": "APPROVED", "ticket_id": ticket_id},
         )
-        # Log HITL Approval event
         log_inferred_event(
             customer_id=ticket["customer_id"],
             inferred_state="Human Verified",
@@ -95,7 +143,6 @@ async def resolve_hitl_ticket(ticket_id: str, action_data: dict):
             category="compliance",
             metadata={"reviewer_action": "REJECTED", "ticket_id": ticket_id},
         )
-        # Log HITL Rejection event
         log_inferred_event(
             customer_id=ticket["customer_id"],
             inferred_state="Draft Rejected",
@@ -108,11 +155,40 @@ async def resolve_hitl_ticket(ticket_id: str, action_data: dict):
 # --- INGESTION ENDPOINT ---
 @app.post("/events/stream")
 async def process_event_stream(event: EventInput):
+    start_time = time.time()
     try:
-        ticket_text = event.payload.get(
-            "ticket_text", event.payload.get("message", "")
+        raw_text = (
+            event.payload.get("ticket_text")
+            or event.payload.get("message")
+            or event.payload.get("text")
+            or event.payload.get("issue")
+            or (event.payload.get("ticket", {}).get("text") if isinstance(event.payload.get("ticket"), dict) else "")
+            or ""
         )
         category = event.payload.get("category", "general")
+
+        # Deduplication & Chronological Sequencing
+        raw_ts = event.payload.get("timestamp") or datetime.now().isoformat()
+        event_dt = parse_iso_timestamp(raw_ts)
+        timeline = customer_event_timelines.setdefault(event.customer_id, [])
+
+        event_id = getattr(event, "event_id", f"EVT-{time.time()}")
+        if any(e.get("event_id") == event_id for e in timeline):
+            return {
+                "status": "SKIPPED_DUPLICATE",
+                "message": f"Event {event_id} already processed. Ignored to prevent double counting."
+            }
+
+        timeline.append({
+            "event_id": event_id,
+            "timestamp": event_dt,
+            "event_type": event.event_type,
+            "payload": event.payload
+        })
+        timeline.sort(key=lambda x: x["timestamp"])
+
+        # PII Masking Guardrail
+        ticket_text = sanitize_pii(raw_text)
 
         # Stage A: Fast-Path Guardrail
         if run_fastpath_guardrail(ticket_text):
@@ -136,10 +212,10 @@ async def process_event_stream(event: EventInput):
         # Stage B: Shared State Initialization
         state = CustomerState(customer_id=event.customer_id)
 
-        # Stage C: Run Non-LLM Swarm Workers
+        # Stage C: Run Scoped Swarm Workers
         await asyncio.gather(
             usage_swarm_worker(event.payload, state),
-            support_swarm_worker(event.payload, state),
+            support_swarm_worker({"ticket_text": ticket_text, "category": category}, state),
             transaction_swarm_worker(event.payload, state),
         )
 
@@ -187,14 +263,20 @@ async def process_event_stream(event: EventInput):
             f"TICK-{event.customer_id}-{datetime.now().strftime('%M%S')}"
         )
 
-        try:
-            usage_trend = float(state.usage_trend)
-        except (TypeError, ValueError):
-            usage_trend = 0.0
+        text_lower = ticket_text.lower() if ticket_text else ""
 
-        inferred_trait = extracted_trait or (
-            "High Churn Risk" if usage_trend < 0 else "Active Customer"
-        )
+        if extracted_trait:
+            inferred_trait = extracted_trait
+        elif any(w in text_lower for w in ["cancel", "awful", "terrible", "leaving", "frustrated", "bad"]):
+            inferred_trait = "CHURN_RISK"
+        elif any(w in text_lower for w in ["payment", "charged", "refund", "billing", "invoice"]):
+            inferred_trait = "BILLING_ISSUE"
+        elif any(w in text_lower for w in ["error", "bug", "crash", "locked", "slow", "down"]):
+            inferred_trait = "TECHNICAL_ISSUE"
+        elif state.sentiment_score and float(state.sentiment_score) < -0.3:
+            inferred_trait = "AT_RISK"
+        else:
+            inferred_trait = "STABLE"
 
         if status_flag == "HITL_REQUIRED":
             hitl_queue[ticket_id] = {
@@ -220,9 +302,16 @@ async def process_event_stream(event: EventInput):
                 action_decided="AUTO_DISPATCH",
             )
 
+        latency_ms = round((time.time() - start_time) * 1000, 2)
+        calc_confidence = 0.95 if status_flag == "PROCESSED" else 0.85
+
         return {
             "status": "SWARM_PROCESSING_COMPLETE",
             "customer_id": state.customer_id,
+            "metrics": {
+                "latency_ms": latency_ms,
+                "confidence_score": calc_confidence,
+            },
             "shared_state_board": {
                 "usage_trend": state.usage_trend,
                 "sentiment_score": state.sentiment_score,
@@ -246,5 +335,5 @@ async def process_event_stream(event: EventInput):
         }
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"DEBUG ERROR: {type(e).__name__} - {str(e)}"
+            status_code=500, detail=f"DEBUG ERROR: {type(e).__name__}: {str(e)}"
         )

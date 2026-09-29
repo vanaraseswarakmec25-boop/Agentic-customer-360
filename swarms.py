@@ -46,8 +46,10 @@ def run_fastpath_guardrail(text: str) -> bool:
 
 # 2. Non-LLM Edge Swarm Workers
 async def usage_swarm_worker(payload: dict, state: CustomerState):
-    weekly_logins = float(payload.get("weekly_logins", 10))
-    baseline_avg = float(payload.get("baseline_avg_logins", 10))
+    usage_data = payload.get("usage", payload) if isinstance(payload.get("usage"), dict) else payload
+    weekly_logins = float(usage_data.get("weekly_logins", 10))
+    baseline_avg = float(usage_data.get("baseline_avg_logins", 10))
+    
     if baseline_avg > 0 and weekly_logins < (0.5 * baseline_avg):
         state.usage_trend = -1.0
     else:
@@ -62,9 +64,17 @@ async def support_swarm_worker(payload: dict, state: CustomerState):
 
 
 async def transaction_swarm_worker(payload: dict, state: CustomerState):
-    amount = payload.get("amount", 0.0)
-    avg_spend = payload.get("avg_spend", 100.0)
-    std_dev = payload.get("std_dev", 20.0)
+    txs = payload.get("transactions", [])
+    if isinstance(txs, list) and len(txs) > 0:
+        latest = txs[-1] if isinstance(txs[-1], dict) else {}
+        amount = float(latest.get("amount", 0.0))
+        avg_spend = float(latest.get("avg_spend", 100.0))
+        std_dev = float(latest.get("std_dev", 20.0))
+    else:
+        amount = float(payload.get("amount", 0.0))
+        avg_spend = float(payload.get("avg_spend", 100.0))
+        std_dev = float(payload.get("std_dev", 20.0))
+
     if std_dev > 0:
         z_score = (amount - avg_spend) / std_dev
         if z_score > 3.0:
@@ -79,7 +89,7 @@ async def run_agent_debate(
 
     system_prompt = """
     You are an AI Strategy Agent resolving customer disputes.
-    Analyze customer state, episodic history, and semantic traits to determine if there is a operational conflict.
+    Analyze customer state, episodic history, and semantic traits to determine if there is an operational conflict.
     
     Return JSON only with these exact keys:
     - "conflict_detected": boolean
@@ -98,7 +108,6 @@ async def run_agent_debate(
 
     res_json = query_groq(system_prompt, user_prompt)
 
-    # Fallback to local heuristic logic if API fails or returns incomplete response
     if not res_json:
         has_vip = any(
             "VIP" in str(m) for m in memories + semantic_facts
@@ -123,21 +132,18 @@ async def run_round_robin_drafting(
 ) -> DraftMessage:
     system_prompt = "You are a customer communications writer. Return JSON only with a single key 'draft'."
 
-    # Pass 1: Base Operational Draft
     p1 = query_groq(
         system_prompt,
         f"Draft a direct operational update message for customer {state.customer_id} applying strategy: {strategy}."
     )
     raw_draft = p1.get("draft", f"Account update for customer {state.customer_id}.")
 
-    # Pass 2: Tone & Sentiment Alignment
     p2 = query_groq(
         system_prompt,
         f"Adjust this draft to align with a customer sentiment score of {state.sentiment_score} (make empathetic if negative): '{raw_draft}'."
     )
     tone_draft = p2.get("draft", raw_draft)
 
-    # Pass 3: Compliance & Strategy Insertion
     p3 = query_groq(
         system_prompt,
         f"Finalize this message ensuring clear action steps for strategy {strategy}: '{tone_draft}'."
@@ -155,7 +161,6 @@ async def run_round_robin_drafting(
 async def run_critique_refiner(draft: DraftMessage) -> RefinerOutput:
     message = draft.compliance_checked_draft
 
-    # Direct Policy Guardrail: Catch refunds, credits, discounts, or escalation flags
     flag_keywords = [
         "100% free",
         "free forever",
@@ -184,7 +189,7 @@ async def run_critique_refiner(draft: DraftMessage) -> RefinerOutput:
 
     if not res_json:
         return RefinerOutput(
-            approved=False,  # Safe default to HITL if LLM call fails
+            approved=False,
             feedback="Audit failed to execute. Routing to human review for safety.",
             final_output=message,
         )
