@@ -6,12 +6,12 @@ class EventInput(BaseModel):
     event_id: str
     customer_id: str
     event_type: str
-    payload: Dict[str, Any]
+    payload: Dict[str, Any]  #Allow ticket_text,category,etc.
 
 # State board schema
 class CustomerState(BaseModel):
     customer_id: str
-    usage_trend: str = "normal"
+    usage_trend: float = 0.0
     sentiment_score: float = 0.0
     transaction_anomaly_score: float = 0.0
 
