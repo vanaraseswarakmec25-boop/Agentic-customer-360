@@ -1,21 +1,21 @@
-import chromadb
-from datetime import datetime
 import os
+from datetime import datetime
+import chromadb
 
-# Initialize persistent ChromaDB client
+# 1. Initialize persistent ChromaDB client
 CHROMA_DB_DIR = os.getenv("CHROMA_DB_DIR", "./chroma_db")
-client = chromadb.PersistentClient(path="./chroma_db")
+chroma_client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
 
-# Clean single initialization per collection
-collection = client.get_or_create_collection(
+# 2. Get or create collections
+collection = chroma_client.get_or_create_collection(
     name="customer_episodic_memory", metadata={"hnsw:space": "cosine"}
 )
-semantic_collection = client.get_or_create_collection(
+semantic_collection = chroma_client.get_or_create_collection(
     name="customer_semantic_memory", metadata={"hnsw:space": "cosine"}
 )
 
 
-# 1. Base function to insert memories into ChromaDB
+# 3. Base function to insert episodic memories
 def add_episodic_memory(
     customer_id: str,
     event_type: str,
@@ -35,7 +35,7 @@ def add_episodic_memory(
     collection.add(documents=[summary], metadatas=[meta], ids=[doc_id])
 
 
-# 2. Base function to query episodic memories
+# 4. Base function to query episodic memories
 def query_episodic_memory(
     customer_id: str,
     query_text: str,
@@ -72,6 +72,7 @@ def query_episodic_memory(
     return memories
 
 
+# 5. Base function to insert semantic memories
 def add_semantic_memory(
     customer_id: str,
     fact: str,
@@ -90,7 +91,7 @@ def add_semantic_memory(
     )
 
 
-# FIX 1: Retrieve ALL semantic facts belonging to this customer directly
+# 6. Retrieve ALL semantic facts belonging to customer directly
 def query_semantic_memory(customer_id: str):
     results = semantic_collection.get(
         where={"customer_id": str(customer_id)}
@@ -110,7 +111,7 @@ def query_semantic_memory(customer_id: str):
     return facts
 
 
-# FIX 2: Context Retriever
+# 7. Context Retriever (Called by main.py)
 async def retrieve_customer_context(
     customer_id: str, query_text: str, category: str = "general"
 ):
@@ -120,17 +121,17 @@ async def retrieve_customer_context(
         category=category,
         similarity_threshold=0.78,
     )
-    
+
     # Direct fetch without vector distance filtering
     semantic_facts = query_semantic_memory(customer_id=customer_id)
-    
+
     return {
         "episodic": episodic_memories,
         "semantic": semantic_facts,
     }
 
 
-# 4. Async Wrapper: Log pipeline outcome
+# 8. Async Wrapper: Log pipeline outcome
 async def log_pipeline_outcome(
     customer_id: str, event_type: str, output_summary: str, category: str
 ):

@@ -1,13 +1,15 @@
-import re
-import os
 import json
+import os
+import re
 from dotenv import load_dotenv
 from groq import Groq
 from schemas import CustomerState, DebateResult, DraftMessage, RefinerOutput
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+# Load environment variables
 load_dotenv()
 
+# Initialize Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL_NAME = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
@@ -16,6 +18,8 @@ LEGAL_FRAUD_PATTERN = (
     r"\b(sue|suing|lawsuit|attorney|lawyer|court|litigation|fraud|hacked|stolen)\b"
 )
 
+
+# Helper function to invoke Groq API with JSON enforcement
 def query_groq(system_prompt: str, user_prompt: str) -> dict:
     try:
         response = client.chat.completions.create(
@@ -32,11 +36,15 @@ def query_groq(system_prompt: str, user_prompt: str) -> dict:
         print(f"Groq API Error: {e}")
         return {}
 
+
+# 1. Fast-Path Guardrail (Synchronous Regex)
 def run_fastpath_guardrail(text: str) -> bool:
     if not text:
         return False
     return bool(re.search(LEGAL_FRAUD_PATTERN, text, re.IGNORECASE))
 
+
+# 2. Non-LLM Edge Swarm Workers
 async def usage_swarm_worker(payload: dict, state: CustomerState):
     weekly_logins = payload.get("weekly_logins", 10)
     baseline_avg = payload.get("baseline_avg_logins", 10)
@@ -62,7 +70,8 @@ async def transaction_swarm_worker(payload: dict, state: CustomerState):
         if z_score > 3.0:
             state.transaction_anomaly_score = round(z_score, 2)
 
-# 1. Multi-Agent Debate Stage (Updated Signature & Dual Memory Inspection)
+
+# 3. Stage E1: Multi-Agent Debate Stage (Groq LLM Powered)
 async def run_agent_debate(
     state: CustomerState, memories: list, semantic_facts: list = None
 ) -> DebateResult:
@@ -86,82 +95,63 @@ async def run_agent_debate(
     Semantic Traits: {semantic_facts}
     Episodic Logs: {memories}
     """
+
     res_json = query_groq(system_prompt, user_prompt)
 
-    if (
-        state.usage_trend == "severe_drop_off_50%"
-        and state.transaction_anomaly_score > 3.0
-    ):
-        # Check episodic memories for VIP mention
-        has_vip_episodic = any(
-            "VIP"
-            in (m.get("summary", "") if isinstance(m, dict) else str(m))
-            for m in memories
+    # Fallback to local heuristic logic if API fails or returns incomplete response
+    if not res_json:
+        has_vip = any(
+            "VIP" in str(m) for m in memories + semantic_facts
         )
-
-        # Check semantic memory facts for VIP mention
-        has_vip_semantic = any(
-            "VIP"
-            in (f.get("fact", "") if isinstance(f, dict) else str(f))
-            for f in semantic_facts
-        )
-
-        has_vip = has_vip_episodic or has_vip_semantic
         strategy = "UPSELL_VIP" if has_vip else "RETENTION_OFFER"
-
         return DebateResult(
             conflict_detected=True,
-            reasoning="Usage dropped severely but transaction Z-score is high. Conflicting signals resolved.",
+            reasoning="Fallback: Usage drop and high anomaly detected.",
             resolution_strategy=strategy,
         )
 
     return DebateResult(
-        conflict_detected=False,
-        reasoning="Metrics align across swarm workers.",
-        resolution_strategy="STANDARD_SUPPORT",
+        conflict_detected=res_json.get("conflict_detected", False),
+        reasoning=res_json.get("reasoning", "Resolved via Groq LLM agent debate."),
+        resolution_strategy=res_json.get("resolution_strategy", "RETENTION_OFFER"),
     )
 
-# 2. Round-Robin Drafting Stage (Deterministic Control Flow + Groq Generation)
+
+# 4. Stage E2: Round-Robin Drafting Stage (Sequential 3-Pass LLM Refinement)
 async def run_round_robin_drafting(
     state: CustomerState, strategy: str
 ) -> DraftMessage:
     system_prompt = "You are a customer communications writer. Return JSON only with a single key 'draft'."
 
-    # Pass 1: Operational Base Draft
+    # Pass 1: Base Operational Draft
     p1 = query_groq(
         system_prompt,
-        f"Draft a concise operational update message for customer {state.customer_id}."
+        f"Draft a direct operational update message for customer {state.customer_id} applying strategy: {strategy}."
     )
-    pass1 = p1.get("draft", f"Account update for customer {state.customer_id}.")
+    raw_draft = p1.get("draft", f"Account update for customer {state.customer_id}.")
 
-    # Pass 2: Tone & Sentiment Alignment (Your Exact If/Else Loop -> Groq Prompting)
-    if state.sentiment_score < -0.3:
-        p2_prompt = f"Rewrite this draft to express sincere apologies for the inconvenience and state that we are reviewing their account priority: '{pass1}'"
-    else:
-        p2_prompt = f"Rewrite this draft to include a brief thank you for being a valued account holder: '{pass1}'"
+    # Pass 2: Tone & Sentiment Alignment
+    p2 = query_groq(
+        system_prompt,
+        f"Adjust this draft to align with a customer sentiment score of {state.sentiment_score} (make empathetic if negative): '{raw_draft}'."
+    )
+    tone_draft = p2.get("draft", raw_draft)
 
-    p2 = query_groq(system_prompt, p2_prompt)
-    pass2 = p2.get("draft", pass1)
-
-    # Pass 3: Strategy & Action Insertion (Your Exact If/Else Loop -> Groq Prompting)
-    if strategy == "UPSELL_VIP":
-        p3_prompt = f"Integrate a clear notice into this message stating that a dedicated VIP account manager has been assigned to their support queue: '{pass2}'"
-        p3 = query_groq(system_prompt, p3_prompt)
-        pass3 = p3.get("draft", pass2)
-    elif strategy == "RETENTION_OFFER":
-        p3_prompt = f"Integrate a clear notice into this message stating that a 15% loyalty retention credit has been flagged for their account: '{pass2}'"
-        p3 = query_groq(system_prompt, p3_prompt)
-        pass3 = p3.get("draft", pass2)
-    else:
-        pass3 = pass2
+    # Pass 3: Compliance & Strategy Insertion
+    p3 = query_groq(
+        system_prompt,
+        f"Finalize this message ensuring clear action steps for strategy {strategy}: '{tone_draft}'."
+    )
+    compliance_draft = p3.get("draft", tone_draft)
 
     return DraftMessage(
-        raw_draft=pass1,
-        tone_adjusted_draft=pass2,
-        compliance_checked_draft=pass3,
+        raw_draft=raw_draft,
+        tone_adjusted_draft=tone_draft,
+        compliance_checked_draft=compliance_draft,
     )
 
-# 3. Critique-Refiner Stage (Policy & HITL Enforcement)
+
+# 5. Stage E3: Critique-Refiner Stage (Policy Guardrail)
 async def run_critique_refiner(draft: DraftMessage) -> RefinerOutput:
     message = draft.compliance_checked_draft
 

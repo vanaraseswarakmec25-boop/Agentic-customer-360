@@ -1,7 +1,7 @@
 import asyncio
 import os
-from dotenv import load_dotenv
 from datetime import datetime
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from memory import (
     add_episodic_memory,
@@ -18,13 +18,22 @@ from swarms import (
     transaction_swarm_worker,
     usage_swarm_worker,
 )
+
+# Load environment variables
 load_dotenv()
 
-# 1. Initialize the FastAPI application
 app = FastAPI(title="Agentic Customer 360 Ingestion Desk")
 
-hitl_queue= {}
+# Global in-memory storage for HITL pending review tickets
+hitl_queue = {}
 
+
+@app.get("/")
+def read_root():
+    return {"message": "Agentic Customer 360 FastAPI Backend is Running!"}
+
+
+# --- HITL QUEUE ENDPOINTS ---
 @app.get("/hitl/queue")
 async def get_hitl_queue():
     """Retrieve all tickets currently pending human review."""
@@ -33,10 +42,7 @@ async def get_hitl_queue():
 
 @app.post("/hitl/action/{ticket_id}")
 async def resolve_hitl_ticket(ticket_id: str, action_data: dict):
-    """
-    Handle human decisions: approve original, approve edited text, or reject.
-    Payload: {"action": "APPROVE" | "REJECT", "final_text": "..."}
-    """
+    """Handle human decisions: approve original, approve edited text, or reject."""
     if ticket_id not in hitl_queue:
         return {"status": "ERROR", "message": "Ticket ID not found in queue."}
 
@@ -45,7 +51,6 @@ async def resolve_hitl_ticket(ticket_id: str, action_data: dict):
     final_text = action_data.get("final_text", ticket.get("final_response", ""))
 
     if action == "APPROVE":
-        # Log approved resolution into Episodic Memory
         add_episodic_memory(
             customer_id=ticket["customer_id"],
             event_type="hitl_human_approval",
@@ -58,9 +63,7 @@ async def resolve_hitl_ticket(ticket_id: str, action_data: dict):
             "message": f"Ticket {ticket_id} approved and dispatched.",
             "final_text": final_text,
         }
-
     else:
-        # Log rejection
         add_episodic_memory(
             customer_id=ticket["customer_id"],
             event_type="hitl_human_rejection",
@@ -70,13 +73,8 @@ async def resolve_hitl_ticket(ticket_id: str, action_data: dict):
         )
         return {"status": "SUCCESS", "message": f"Ticket {ticket_id} rejected."}
 
-# Root check endpoint
-@app.get("/")
-def read_root():
-    return {"message": "Agentic Customer 360 FastAPI Backend is Running!"}
 
-
-# 2. Endpoint running Fast-Path Guardrails, Parallel Workers, and Dual-Memory Swarms
+# --- INGESTION ENDPOINT ---
 @app.post("/events/stream")
 async def process_event_stream(event: EventInput):
     ticket_text = event.payload.get(
@@ -84,7 +82,7 @@ async def process_event_stream(event: EventInput):
     )
     category = event.payload.get("category", "general")
 
-    # Stage A: Fast-Path Guardrail (Synchronous Regex Scan)
+    # Stage A: Fast-Path Guardrail
     if run_fastpath_guardrail(ticket_text):
         output = InferredEventOutput(
             customer_id=event.customer_id,
@@ -97,16 +95,17 @@ async def process_event_stream(event: EventInput):
         )
         return {"status": "HALTED_LEGAL_ESCALATION", "data": output}
 
-    # Stage B: Shared State Board Initialization
+    # Stage B: Shared State Initialization
     state = CustomerState(customer_id=event.customer_id)
 
-    # Stage C: Run Non-LLM Swarm Workers in Parallel
+    # Stage C: Run Non-LLM Swarm Workers
     await asyncio.gather(
         usage_swarm_worker(event.payload, state),
         support_swarm_worker(event.payload, state),
         transaction_swarm_worker(event.payload, state),
     )
 
+    # Save Semantic Trait BEFORE Context Retrieval
     extracted_trait = event.payload.get("extracted_trait")
     if extracted_trait:
         add_semantic_memory(
@@ -115,7 +114,7 @@ async def process_event_stream(event: EventInput):
             category=category,
         )
 
-    # Stage D: Retrieve Dual Memory Context (Episodic + Semantic)
+    # Stage D: Retrieve Dual Memory Context
     context = await retrieve_customer_context(
         customer_id=event.customer_id,
         query_text=ticket_text or event.event_type,
@@ -135,7 +134,7 @@ async def process_event_stream(event: EventInput):
     )
     refiner_result = await run_critique_refiner(draft_result)
 
-    # Stage F: Store Episodic Memory (Event Logs)
+    # Stage F: Store Episodic Memory
     add_episodic_memory(
         customer_id=event.customer_id,
         event_type=event.event_type,
@@ -145,7 +144,6 @@ async def process_event_stream(event: EventInput):
     )
 
     status_flag = "PROCESSED" if refiner_result.approved else "HITL_REQUIRED"
-
     ticket_id = f"TICK-{event.customer_id}-{datetime.now().strftime('%M%S')}"
 
     if status_flag == "HITL_REQUIRED":
@@ -159,7 +157,6 @@ async def process_event_stream(event: EventInput):
             "status": status_flag,
         }
 
-    # Return populated payload including dual vector memory counts & agent outputs
     return {
         "status": "SWARM_PROCESSING_COMPLETE",
         "customer_id": state.customer_id,
